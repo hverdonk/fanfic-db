@@ -18,7 +18,10 @@ def test_public_download_without_auth(tmp_path):
         result = downloader.download("https://archiveofourown.org/works/123", "123")
 
     assert result.epub_path == epub
-    assert "--cookiefile" not in run.call_args.args[0]
+    assert "--mozilla-cookies" not in run.call_args.args[0]
+    assert "--output" not in run.call_args.args[0]
+    assert "output_filename=ao3-123.epub" in run.call_args.args[0]
+    assert run.call_args.kwargs["cwd"] == tmp_path
 
 
 def test_restricted_download_with_cookies(tmp_path):
@@ -28,7 +31,7 @@ def test_restricted_download_with_cookies(tmp_path):
 
     cmd = downloader.build_command("https://archiveofourown.org/works/123", tmp_path / "ao3-123.epub")
 
-    assert "--cookiefile" in cmd
+    assert "--mozilla-cookies" in cmd
     assert str(cookie_file) in cmd
 
 

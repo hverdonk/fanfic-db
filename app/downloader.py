@@ -90,14 +90,14 @@ class FanFicFareDownloader:
             "fanficfare",
             "--non-interactive",
             "--format=epub",
-            "--output",
-            str(epub_path),
+            "--option",
+            f"output_filename={epub_path.name}",
         ]
 
         if self.auth_mode == "cookies":
             if not self.cookie_file or not self.cookie_file.exists():
                 raise DownloadError("AO3 login required or session expired. Refresh the cookie file if configured.", auth_failed=True)
-            cmd.extend(["--cookiefile", str(self.cookie_file)])
+            cmd.extend(["--mozilla-cookies", str(self.cookie_file)])
         elif self.auth_mode == "credentials":
             username = _read_secret_file(self.username_file, "AO3 username")
             password = _read_secret_file(self.password_file, "AO3 password")
@@ -117,7 +117,7 @@ class FanFicFareDownloader:
         if update and epub_path.exists():
             cmd.insert(1, "--update-epub")
 
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, cwd=self.download_dir, capture_output=True, text=True, timeout=300)
         if result.returncode != 0:
             raise classify_fanficfare_error(result.stderr)
         if not epub_path.exists():
