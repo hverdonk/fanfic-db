@@ -1,0 +1,11 @@
+.mamba-env/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+config/
+downloads/
+*.sqlite3
+*.db
+
+.env

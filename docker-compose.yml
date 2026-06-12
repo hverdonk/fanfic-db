@@ -1,0 +1,23 @@
+services:
+  send-to-library:
+    build: .
+    container_name: send-to-library
+    ports:
+      - "8000:8000"
+    environment:
+      TZ: "${TZ:-UTC}"
+      API_TOKEN: "${API_TOKEN:-}"
+      CALIBRE_LIBRARY_PATH: /library
+      DOWNLOAD_DIR: /downloads
+      DATABASE_PATH: /config/fanfic-db.sqlite3
+      CALIBRE_TAGS: ao3,fanficfare,unread
+      AO3_AUTH_MODE: "${AO3_AUTH_MODE:-none}"
+      AO3_COOKIE_FILE: /config/cookies.txt
+      DOWNLOAD_DELAY_SECONDS: "2"
+    volumes:
+      - ./config:/config
+      - ./downloads:/downloads
+      - /path/to/your/Calibre Library:/library
+      # For logged-in AO3 downloads, export your own AO3 cookies and enable:
+      # - ./config/cookies.txt:/config/cookies.txt:ro
+    restart: unless-stopped
