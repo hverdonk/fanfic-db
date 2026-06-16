@@ -92,13 +92,13 @@ This app does not bypass AO3 access controls. It only supports downloading works
 
 ## Phone Share Setup
 
-### iOS Shortcut
+### iOS Shortcut With Progress
 
-Create a shortcut that appears in the share sheet:
+Create a shortcut that appears in the share sheet. Use the async endpoint so the phone gets a response immediately, then polls the status endpoint while the server downloads and imports the EPUB.
 
 1. Receive `URLs` from share sheet.
 2. Add `Get Contents of URL`.
-3. URL: `http://your-server:8000/add`
+3. URL: `http://your-server:8000/add-async`
 4. Method: `POST`
 5. Headers:
    - `Content-Type`: `application/json`
@@ -108,6 +108,15 @@ Create a shortcut that appears in the share sheet:
 ```json
 {"url":"Shortcut Input"}
 ```
+
+7. Save `status_url` from the response dictionary.
+8. Repeat until the returned `done` value is true:
+   - Wait 2 seconds.
+   - Get Contents of `status_url` with method `GET`.
+   - Show notification or update progress text using `progress`, `status`, and `message`.
+9. When `done` is true, show `title` if `ok` is true, otherwise show `message`.
+
+The `progress` value is coarse server-side stage progress: queued is 5, downloading is 35, importing is 80, and done or error is 100. FanFicFare does not expose reliable byte-level progress here, but this avoids a single long-running phone request with no visible state. The original `/add` endpoint still works for clients that prefer to wait for the final response.
 
 ### Firefox or Safari
 

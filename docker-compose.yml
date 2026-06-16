@@ -2,6 +2,7 @@ services:
   send-to-library:
     build: .
     container_name: send-to-library
+    init: true
     ports:
       - "8000:8000"
     environment:

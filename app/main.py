@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
@@ -24,6 +23,30 @@ class AddResponse(BaseModel):
     author: str | None
     calibre_book_id: int | None
     source_url: str
+
+
+class QueueResponse(BaseModel):
+    ok: bool
+    action: str
+    work_id: str
+    source_url: str
+    status_url: str
+    status: str
+    message: str | None
+    progress: int
+
+
+class WorkStatusResponse(BaseModel):
+    ok: bool
+    work_id: str
+    title: str | None
+    author: str | None
+    calibre_book_id: int | None
+    source_url: str
+    status: str
+    message: str | None
+    progress: int
+    done: bool
 
 
 def get_db() -> Database:
@@ -86,6 +109,51 @@ def add_work(payload: AddRequest, db: Database = Depends(get_db)) -> AddResponse
     return _add_url(payload.url, db)
 
 
+@app.post(
+    "/add-async",
+    response_model=QueueResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_token)],
+)
+def add_work_async(
+    payload: AddRequest,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    db: Database = Depends(get_db),
+) -> QueueResponse:
+    canonical_url, work_id = _normalize_or_400(payload.url)
+    existing = db.get_work(work_id)
+    action = "updated" if existing and existing.calibre_book_id else "added"
+    record = db.upsert_work(work_id=work_id, source_url=canonical_url, status="pending", message="Download queued")
+
+    background_tasks.add_task(
+        _run_add_job,
+        canonical_url,
+        work_id,
+        existing.calibre_book_id if existing else None,
+        action,
+    )
+
+    return QueueResponse(
+        ok=True,
+        action=action,
+        work_id=work_id,
+        source_url=record.source_url,
+        status_url=str(request.url_for("work_status", work_id=work_id)),
+        status=record.status,
+        message=record.message,
+        progress=_progress_for(record.status),
+    )
+
+
+@app.get("/status/{work_id}", response_model=WorkStatusResponse, dependencies=[Depends(require_token)])
+def work_status(work_id: str, db: Database = Depends(get_db)) -> WorkStatusResponse:
+    record = db.get_work(work_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Unknown AO3 work ID")
+    return _status_response(record)
+
+
 @app.post("/add-form", response_class=HTMLResponse)
 async def add_form(request: Request, db: Database = Depends(get_db)) -> HTMLResponse:
     form = await request.form()
@@ -97,20 +165,35 @@ async def add_form(request: Request, db: Database = Depends(get_db)) -> HTMLResp
 
 
 def _add_url(raw_url: str, db: Database) -> AddResponse:
-    try:
-        canonical_url, work_id = normalize_ao3_url(raw_url)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    canonical_url, work_id = _normalize_or_400(raw_url)
 
     existing = db.get_work(work_id)
     action = "updated" if existing and existing.calibre_book_id else "added"
     db.upsert_work(work_id=work_id, source_url=canonical_url, status="pending", message="Download queued")
+    return _download_and_import(db, canonical_url, work_id, existing.calibre_book_id if existing else None, action)
 
+
+def _normalize_or_400(raw_url: str) -> tuple[str, str]:
     try:
+        return normalize_ao3_url(raw_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _download_and_import(
+    db: Database,
+    canonical_url: str,
+    work_id: str,
+    existing_book_id: int | None,
+    action: str,
+) -> AddResponse:
+    try:
+        db.upsert_work(work_id=work_id, source_url=canonical_url, status="downloading", message="Downloading EPUB")
         downloader = FanFicFareDownloader.from_env()
-        downloaded = downloader.download(canonical_url, work_id, update=bool(existing))
+        downloaded = downloader.download(canonical_url, work_id, update=bool(existing_book_id))
+        db.upsert_work(work_id=work_id, source_url=canonical_url, status="importing", message="Importing into Calibre")
         calibre = CalibreLibrary.from_env()
-        imported = calibre.add_or_update(downloaded.epub_path, existing.calibre_book_id if existing else None)
+        imported = calibre.add_or_update(downloaded.epub_path, existing_book_id)
     except DownloadError as exc:
         db.upsert_work(work_id=work_id, source_url=canonical_url, status="error", message=str(exc))
         status_code = 401 if exc.auth_failed else 502
@@ -141,6 +224,44 @@ def _add_url(raw_url: str, db: Database) -> AddResponse:
         calibre_book_id=record.calibre_book_id,
         source_url=record.source_url,
     )
+
+
+def _run_add_job(
+    canonical_url: str,
+    work_id: str,
+    existing_book_id: int | None,
+    action: str,
+) -> None:
+    db = get_db()
+    try:
+        _download_and_import(db, canonical_url, work_id, existing_book_id, action)
+    except HTTPException:
+        pass
+
+
+def _status_response(record) -> WorkStatusResponse:
+    return WorkStatusResponse(
+        ok=record.status == "ok",
+        work_id=record.work_id,
+        title=record.title,
+        author=record.author,
+        calibre_book_id=record.calibre_book_id,
+        source_url=record.source_url,
+        status=record.status,
+        message=record.message,
+        progress=_progress_for(record.status),
+        done=record.status in {"ok", "error"},
+    )
+
+
+def _progress_for(status_value: str) -> int:
+    return {
+        "pending": 5,
+        "downloading": 35,
+        "importing": 80,
+        "ok": 100,
+        "error": 100,
+    }.get(status_value, 0)
 
 
 def _esc(value: str) -> str:
