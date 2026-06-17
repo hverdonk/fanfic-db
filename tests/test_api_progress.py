@@ -72,3 +72,47 @@ def test_status_endpoint_marks_complete_work_done(tmp_path):
     assert response.progress == 100
     assert response.title == "Example"
     assert response.calibre_book_id == 7
+
+
+def test_add_endpoint_expands_series_urls(tmp_path, monkeypatch):
+    from app.main import AddResponse, add_work
+
+    db = Database(tmp_path / "test.sqlite3")
+    calls = []
+
+    monkeypatch.setattr(
+        "app.main.resolve_series_work_urls",
+        lambda _url: [
+            ("https://archiveofourown.org/works/111", "111"),
+            ("https://archiveofourown.org/works/222", "222"),
+        ],
+    )
+
+    def fake_download_and_import(db, canonical_url, work_id, existing_book_id, action):
+        calls.append((canonical_url, work_id, existing_book_id, action))
+        return AddResponse(
+            ok=True,
+            action=action,
+            work_id=work_id,
+            title=f"Work {work_id}",
+            author="Author",
+            calibre_book_id=int(work_id),
+            source_url=canonical_url,
+        )
+
+    monkeypatch.setattr("app.main._download_and_import", fake_download_and_import)
+
+    response = add_work(AddRequest(url="https://archiveofourown.org/series/3073359"), db)
+
+    assert response.ok is True
+    assert response.action == "series_added"
+    assert response.series_id == "3073359"
+    assert response.source_url == "https://archiveofourown.org/series/3073359"
+    assert response.work_count == 2
+    assert response.added == 2
+    assert response.updated == 0
+    assert [work.work_id for work in response.works] == ["111", "222"]
+    assert calls == [
+        ("https://archiveofourown.org/works/111", "111", None, "added"),
+        ("https://archiveofourown.org/works/222", "222", None, "added"),
+    ]

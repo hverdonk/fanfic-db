@@ -5,8 +5,10 @@ import re
 import subprocess
 import time
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
+from urllib.request import Request, urlopen
 
 
 class DownloadError(RuntimeError):
@@ -24,6 +26,7 @@ class DownloadResult:
 
 AO3_HOSTS = {"archiveofourown.org", "www.archiveofourown.org"}
 WORK_PATH_RE = re.compile(r"^/works/(\d+)")
+SERIES_PATH_RE = re.compile(r"^/series/(\d+)")
 
 
 def normalize_ao3_url(raw_url: str) -> tuple[str, str]:
@@ -37,6 +40,84 @@ def normalize_ao3_url(raw_url: str) -> tuple[str, str]:
         raise ValueError("URL must be an AO3 work URL")
     work_id = match.group(1)
     return f"https://archiveofourown.org/works/{work_id}", work_id
+
+
+def normalize_ao3_series_url(raw_url: str) -> tuple[str, str]:
+    parsed = urlparse(raw_url.strip())
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("URL must use http or https")
+    if parsed.hostname not in AO3_HOSTS:
+        raise ValueError("URL must be from archiveofourown.org")
+    match = SERIES_PATH_RE.match(parsed.path)
+    if not match:
+        raise ValueError("URL must be an AO3 series URL")
+    series_id = match.group(1)
+    return f"https://archiveofourown.org/series/{series_id}", series_id
+
+
+def resolve_series_work_urls(series_url: str) -> list[tuple[str, str]]:
+    canonical_url, _series_id = normalize_ao3_series_url(series_url)
+    urls_by_id: dict[str, str] = {}
+    next_url: str | None = canonical_url
+    seen_pages: set[str] = set()
+
+    while next_url:
+        if next_url in seen_pages:
+            raise DownloadError("AO3 series pagination loop detected")
+        if len(seen_pages) >= 100:
+            raise DownloadError("AO3 series has too many pages to process safely")
+        seen_pages.add(next_url)
+
+        parser = _SeriesPageParser(next_url)
+        parser.feed(_fetch_ao3_page(next_url))
+        for work_url, work_id in parser.work_urls:
+            urls_by_id.setdefault(work_id, work_url)
+        next_url = parser.next_url
+
+    if not urls_by_id:
+        raise DownloadError("AO3 series page did not contain any works")
+    return [(work_url, work_id) for work_id, work_url in urls_by_id.items()]
+
+
+def _fetch_ao3_page(url: str) -> str:
+    request = Request(url, headers={"User-Agent": "fanfic-db/1.0"})
+    try:
+        with urlopen(request, timeout=30) as response:
+            return response.read().decode("utf-8", errors="replace")
+    except OSError as exc:
+        raise DownloadError("Failed to fetch AO3 series page") from exc
+
+
+class _SeriesPageParser(HTMLParser):
+    def __init__(self, page_url: str):
+        super().__init__(convert_charrefs=True)
+        self.page_url = page_url
+        self.work_urls: list[tuple[str, str]] = []
+        self.next_url: str | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "a":
+            return
+        attr_map = {name: value or "" for name, value in attrs}
+        href = attr_map.get("href", "")
+        if not href:
+            return
+
+        absolute_url = urljoin(self.page_url, href)
+        parsed = urlparse(absolute_url)
+        if parsed.hostname not in AO3_HOSTS:
+            return
+
+        work_match = WORK_PATH_RE.match(parsed.path)
+        if work_match:
+            work_id = work_match.group(1)
+            self.work_urls.append((f"https://archiveofourown.org/works/{work_id}", work_id))
+            return
+
+        series_match = SERIES_PATH_RE.match(parsed.path)
+        rel_values = {value.strip().lower() for value in attr_map.get("rel", "").split()}
+        if series_match and "next" in rel_values:
+            self.next_url = absolute_url
 
 
 def classify_fanficfare_error(stderr: str) -> DownloadError:

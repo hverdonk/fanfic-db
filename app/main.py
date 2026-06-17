@@ -8,7 +8,13 @@ from pydantic import BaseModel
 
 from .calibre import CalibreError, CalibreLibrary
 from .db import Database
-from .downloader import DownloadError, FanFicFareDownloader, normalize_ao3_url
+from .downloader import (
+    DownloadError,
+    FanFicFareDownloader,
+    normalize_ao3_series_url,
+    normalize_ao3_url,
+    resolve_series_work_urls,
+)
 
 
 class AddRequest(BaseModel):
@@ -23,6 +29,17 @@ class AddResponse(BaseModel):
     author: str | None
     calibre_book_id: int | None
     source_url: str
+
+
+class AddSeriesResponse(BaseModel):
+    ok: bool
+    action: str
+    series_id: str
+    source_url: str
+    work_count: int
+    added: int
+    updated: int
+    works: list[AddResponse]
 
 
 class QueueResponse(BaseModel):
@@ -104,8 +121,8 @@ def index(request: Request, db: Database = Depends(get_db)) -> str:
     """
 
 
-@app.post("/add", response_model=AddResponse, dependencies=[Depends(require_token)])
-def add_work(payload: AddRequest, db: Database = Depends(get_db)) -> AddResponse:
+@app.post("/add", response_model=AddResponse | AddSeriesResponse, dependencies=[Depends(require_token)])
+def add_work(payload: AddRequest, db: Database = Depends(get_db)) -> AddResponse | AddSeriesResponse:
     return _add_url(payload.url, db)
 
 
@@ -164,9 +181,39 @@ async def add_form(request: Request, db: Database = Depends(get_db)) -> HTMLResp
         return HTMLResponse(f"<p>{_esc(str(exc.detail))}</p><p><a href='/'>Back</a></p>", status_code=exc.status_code)
 
 
-def _add_url(raw_url: str, db: Database) -> AddResponse:
-    canonical_url, work_id = _normalize_or_400(raw_url)
+def _add_url(raw_url: str, db: Database) -> AddResponse | AddSeriesResponse:
+    try:
+        canonical_url, work_id = normalize_ao3_url(raw_url)
+    except ValueError:
+        return _add_series_url(raw_url, db)
 
+    return _add_work_url(db, canonical_url, work_id)
+
+
+def _add_series_url(raw_url: str, db: Database) -> AddSeriesResponse:
+    try:
+        canonical_url, series_id = normalize_ao3_series_url(raw_url)
+        work_urls = resolve_series_work_urls(canonical_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="URL must be an AO3 work or series URL") from exc
+    except DownloadError as exc:
+        status_code = 401 if exc.auth_failed else 502
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+
+    works = [_add_work_url(db, work_url, work_id) for work_url, work_id in work_urls]
+    return AddSeriesResponse(
+        ok=True,
+        action="series_added",
+        series_id=series_id,
+        source_url=canonical_url,
+        work_count=len(works),
+        added=sum(1 for work in works if work.action == "added"),
+        updated=sum(1 for work in works if work.action == "updated"),
+        works=works,
+    )
+
+
+def _add_work_url(db: Database, canonical_url: str, work_id: str) -> AddResponse:
     existing = db.get_work(work_id)
     action = "updated" if existing and existing.calibre_book_id else "added"
     db.upsert_work(work_id=work_id, source_url=canonical_url, status="pending", message="Download queued")
