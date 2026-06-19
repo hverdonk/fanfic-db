@@ -1,5 +1,7 @@
+import pytest
+
 from app.db import Database
-from app.main import AddRequest, add_work_async, work_status
+from app.main import AddRequest, add_form, add_work_async, queued, work_status
 
 
 class FakeBackgroundTasks:
@@ -14,6 +16,14 @@ class FakeRequest:
     def url_for(self, route_name, **path_params):
         assert route_name == "work_status"
         return f"http://testserver/status/{path_params['work_id']}"
+
+
+class FakeFormRequest(FakeRequest):
+    def __init__(self, url):
+        self.url = url
+
+    async def form(self):
+        return {"url": self.url}
 
 
 def test_async_add_returns_status_url_without_running_download(tmp_path):
@@ -116,3 +126,42 @@ def test_add_endpoint_expands_series_urls(tmp_path, monkeypatch):
         ("https://archiveofourown.org/works/111", "111", None, "added"),
         ("https://archiveofourown.org/works/222", "222", None, "added"),
     ]
+
+
+@pytest.mark.anyio
+async def test_add_form_queues_work_and_redirects(tmp_path, monkeypatch):
+    db = Database(tmp_path / "test.sqlite3")
+    background_tasks = FakeBackgroundTasks()
+
+    monkeypatch.setattr("app.main._run_add_job", lambda *args: None)
+
+    response = await add_form(
+        FakeFormRequest("https://archiveofourown.org/works/123"),
+        background_tasks,
+        db,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/queued/123"
+    record = db.get_work("123")
+    assert record is not None
+    assert record.status == "pending"
+    assert record.message == "Download queued"
+    assert len(background_tasks.tasks) == 1
+
+
+def test_queued_page_shows_progress(tmp_path):
+    db = Database(tmp_path / "test.sqlite3")
+    db.upsert_work(
+        work_id="123",
+        source_url="https://archiveofourown.org/works/123",
+        status="downloading",
+        message="Downloading EPUB",
+    )
+
+    response = queued("123", db)
+
+    assert response.status_code == 200
+    assert "Status: downloading" in response.body.decode()
+    assert 'value="35"' in response.body.decode()
+    assert "Downloading EPUB" in response.body.decode()

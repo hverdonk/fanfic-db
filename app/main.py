@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, status
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel
 
 from .calibre import CalibreError, CalibreLibrary
@@ -138,7 +138,16 @@ def add_work_async(
     request: Request,
     db: Database = Depends(get_db),
 ) -> QueueResponse:
-    canonical_url, work_id = _normalize_or_400(payload.url)
+    return _queue_work_url(payload.url, background_tasks, request, db)
+
+
+def _queue_work_url(
+    raw_url: str,
+    background_tasks: BackgroundTasks,
+    request: Request,
+    db: Database,
+) -> QueueResponse:
+    canonical_url, work_id = _normalize_or_400(raw_url)
     existing = db.get_work(work_id)
     action = "updated" if existing and existing.calibre_book_id else "added"
     record = db.upsert_work(work_id=work_id, source_url=canonical_url, status="pending", message="Download queued")
@@ -172,13 +181,50 @@ def work_status(work_id: str, db: Database = Depends(get_db)) -> WorkStatusRespo
 
 
 @app.post("/add-form", response_class=HTMLResponse)
-async def add_form(request: Request, db: Database = Depends(get_db)) -> HTMLResponse:
+async def add_form(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Database = Depends(get_db),
+) -> Response:
     form = await request.form()
     try:
-        _add_url(str(form.get("url", "")), db)
-        return HTMLResponse('<meta http-equiv="refresh" content="0; url=/" />', status_code=303)
+        response = _queue_work_url(str(form.get("url", "")), background_tasks, request, db)
+        return RedirectResponse(f"/queued/{response.work_id}", status_code=303)
     except HTTPException as exc:
         return HTMLResponse(f"<p>{_esc(str(exc.detail))}</p><p><a href='/'>Back</a></p>", status_code=exc.status_code)
+
+
+@app.get("/queued/{work_id}", response_class=HTMLResponse)
+def queued(work_id: str, db: Database = Depends(get_db)) -> HTMLResponse:
+    record = db.get_work(work_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Unknown AO3 work ID")
+    status_text = _esc(record.status)
+    message = _esc(record.message or "")
+    return HTMLResponse(
+        f"""
+        <!doctype html>
+        <html lang="en">
+        <head>
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          <meta http-equiv="refresh" content="3">
+          <title>Download queued</title>
+          <style>
+            body {{ font-family: system-ui, sans-serif; max-width: 720px; margin: 0 auto; padding: 1rem; }}
+            progress {{ width: 100%; height: 1.25rem; }}
+            a {{ color: inherit; }}
+          </style>
+        </head>
+        <body>
+          <h1>{_esc(record.title or "Download queued")}</h1>
+          <p>Status: {status_text}</p>
+          <progress value="{_progress_for(record.status)}" max="100"></progress>
+          <p>{message}</p>
+          <p><a href="/">Recent downloads</a></p>
+        </body>
+        </html>
+        """
+    )
 
 
 def _add_url(raw_url: str, db: Database) -> AddResponse | AddSeriesResponse:
