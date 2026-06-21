@@ -240,7 +240,7 @@ def _download_and_import(
         downloaded = downloader.download(canonical_url, work_id, update=bool(existing_book_id))
         db.upsert_work(work_id=work_id, source_url=canonical_url, status="importing", message="Importing into Calibre")
         calibre = CalibreLibrary.from_env()
-        imported = calibre.add_or_update(downloaded.epub_path, existing_book_id)
+        imported = calibre.add_or_update(downloaded.epub_path, existing_book_id, canonical_url)
     except DownloadError as exc:
         db.upsert_work(work_id=work_id, source_url=canonical_url, status="error", message=str(exc))
         status_code = 401 if exc.auth_failed else 502

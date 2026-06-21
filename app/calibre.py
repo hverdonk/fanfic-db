@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sqlite3
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -35,13 +36,19 @@ class CalibreLibrary:
         if not os.access(self.library_path, os.W_OK):
             raise CalibreError("Calibre library path is not writable")
 
-    def add_or_update(self, epub_path: Path, existing_book_id: int | None = None) -> CalibreImportResult:
+    def add_or_update(
+        self,
+        epub_path: Path,
+        existing_book_id: int | None = None,
+        source_url: str | None = None,
+    ) -> CalibreImportResult:
         self.ensure_ready()
-        if existing_book_id:
-            self._run(["calibredb", "add_format", str(existing_book_id), str(epub_path), "--with-library", str(self.library_path), "--dont-replace"], allow_replace=True)
-            self._set_tags(existing_book_id)
-            meta = self._metadata(existing_book_id)
-            return CalibreImportResult(existing_book_id, meta.get("title"), _first_author(meta))
+        book_id = existing_book_id or (self._find_book_by_url(source_url) if source_url else None)
+        if book_id:
+            self._add_or_replace_format(book_id, epub_path)
+            self._set_tags(book_id)
+            meta = self._metadata(book_id)
+            return CalibreImportResult(book_id, meta.get("title"), _first_author(meta))
 
         result = self._run(["calibredb", "add", str(epub_path), "--with-library", str(self.library_path), "--duplicates"])
         book_id = _parse_added_book_id(result.stdout)
@@ -55,9 +62,34 @@ class CalibreLibrary:
         if self.tags:
             self._run(["calibredb", "set_metadata", str(book_id), "--with-library", str(self.library_path), "--field", f"tags:{','.join(self.tags)}"])
 
+    def _add_or_replace_format(self, book_id: int, epub_path: Path) -> None:
+        self._run(["calibredb", "add_format", str(book_id), str(epub_path), "--with-library", str(self.library_path), "--dont-replace"], allow_replace=True)
+
     def _metadata(self, book_id: int) -> dict:
         result = self._run(["calibredb", "show_metadata", str(book_id), "--with-library", str(self.library_path), "--as-opf"])
         return _metadata_from_opf(result.stdout)
+
+    def _find_book_by_url(self, source_url: str | None) -> int | None:
+        if not source_url:
+            return None
+        metadata_path = self.library_path / "metadata.db"
+        if not metadata_path.exists():
+            raise CalibreError("Calibre metadata database does not exist")
+        try:
+            with sqlite3.connect(metadata_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT book
+                    FROM identifiers
+                    WHERE type = 'url' AND val = ?
+                    ORDER BY book DESC
+                    LIMIT 1
+                    """,
+                    (source_url,),
+                ).fetchone()
+        except sqlite3.Error as exc:
+            raise CalibreError(f"Could not search Calibre identifiers: {exc}") from exc
+        return int(row[0]) if row else None
 
     @staticmethod
     def _run(cmd: list[str], *, allow_replace: bool = False) -> subprocess.CompletedProcess[str]:
