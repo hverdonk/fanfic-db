@@ -1,5 +1,10 @@
+import pytest
+from fastapi import HTTPException
+
+from app.calibre import CalibreError, CalibreImportResult
 from app.db import Database
-from app.main import AddRequest, add_work_async, work_status
+from app.downloader import DownloadResult
+from app.main import AddRequest, _download_and_import, add_work_async, work_status
 
 
 class FakeBackgroundTasks:
@@ -116,3 +121,55 @@ def test_add_endpoint_expands_series_urls(tmp_path, monkeypatch):
         ("https://archiveofourown.org/works/111", "111", None, "added"),
         ("https://archiveofourown.org/works/222", "222", None, "added"),
     ]
+
+
+def test_downloaded_epub_is_deleted_after_successful_import(tmp_path, monkeypatch):
+    db = Database(tmp_path / "test.sqlite3")
+    epub = tmp_path / "downloads" / "ao3-123.epub"
+    epub.parent.mkdir()
+    epub.write_text("epub", encoding="utf-8")
+
+    class FakeDownloader:
+        def download(self, canonical_url, work_id, *, update=False):
+            assert canonical_url == "https://archiveofourown.org/works/123"
+            assert work_id == "123"
+            assert update is False
+            return DownloadResult(epub_path=epub)
+
+    class FakeCalibre:
+        def add_or_update(self, epub_path, existing_book_id=None, source_url=None):
+            assert epub_path == epub
+            assert epub.exists()
+            return CalibreImportResult(book_id=9, title="Example", author="Author")
+
+    monkeypatch.setattr("app.main.FanFicFareDownloader.from_env", staticmethod(lambda: FakeDownloader()))
+    monkeypatch.setattr("app.main.CalibreLibrary.from_env", staticmethod(lambda: FakeCalibre()))
+
+    response = _download_and_import(db, "https://archiveofourown.org/works/123", "123", None, "added")
+
+    assert response.ok is True
+    assert response.calibre_book_id == 9
+    assert not epub.exists()
+
+
+def test_downloaded_epub_is_kept_when_import_fails(tmp_path, monkeypatch):
+    db = Database(tmp_path / "test.sqlite3")
+    epub = tmp_path / "downloads" / "ao3-123.epub"
+    epub.parent.mkdir()
+    epub.write_text("epub", encoding="utf-8")
+
+    class FakeDownloader:
+        def download(self, canonical_url, work_id, *, update=False):
+            return DownloadResult(epub_path=epub)
+
+    class FakeCalibre:
+        def add_or_update(self, epub_path, existing_book_id=None, source_url=None):
+            raise CalibreError("import failed")
+
+    monkeypatch.setattr("app.main.FanFicFareDownloader.from_env", staticmethod(lambda: FakeDownloader()))
+    monkeypatch.setattr("app.main.CalibreLibrary.from_env", staticmethod(lambda: FakeCalibre()))
+
+    with pytest.raises(HTTPException):
+        _download_and_import(db, "https://archiveofourown.org/works/123", "123", None, "added")
+
+    assert epub.exists()
