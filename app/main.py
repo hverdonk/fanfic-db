@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, Request, status
@@ -78,6 +79,7 @@ def require_token(authorization: str | None = Header(default=None)) -> None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing or invalid API token")
 
 
+logger = logging.getLogger(__name__)
 app = FastAPI(title="Send to Library")
 
 
@@ -241,7 +243,6 @@ def _download_and_import(
         db.upsert_work(work_id=work_id, source_url=canonical_url, status="importing", message="Importing into Calibre")
         calibre = CalibreLibrary.from_env()
         imported = calibre.add_or_update(downloaded.epub_path, existing_book_id, canonical_url)
-        downloaded.epub_path.unlink(missing_ok=True)
     except DownloadError as exc:
         db.upsert_work(work_id=work_id, source_url=canonical_url, status="error", message=str(exc))
         status_code = 401 if exc.auth_failed else 502
@@ -263,6 +264,10 @@ def _download_and_import(
         author=imported.author,
         message=action,
     )
+    try:
+        downloaded.epub_path.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Staging EPUB cleanup failed for AO3 work %s; import succeeded", work_id)
     return AddResponse(
         ok=True,
         action=action,

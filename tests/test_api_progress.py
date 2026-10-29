@@ -173,3 +173,65 @@ def test_downloaded_epub_is_kept_when_import_fails(tmp_path, monkeypatch):
         _download_and_import(db, "https://archiveofourown.org/works/123", "123", None, "added")
 
     assert epub.exists()
+
+
+@pytest.mark.parametrize("cleanup_error", [PermissionError("denied"), OSError("filesystem error")])
+def test_cleanup_failure_preserves_success(tmp_path, monkeypatch, caplog, cleanup_error):
+    from pathlib import Path
+
+    db = Database(tmp_path / "test.sqlite3")
+    epub = tmp_path / "ao3-123.epub"
+    epub.write_text("epub")
+    monkeypatch.setattr(
+        "app.main.FanFicFareDownloader.download",
+        lambda *args, **kwargs: DownloadResult(epub_path=epub),
+    )
+    monkeypatch.setattr(
+        "app.main.CalibreLibrary.add_or_update",
+        lambda *args, **kwargs: CalibreImportResult(9, "Example", "Author"),
+    )
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path))
+
+    def fail_cleanup(path, **kwargs):
+        record = db.get_work("123")
+        assert record.status == "ok"
+        assert record.calibre_book_id == 9
+        raise cleanup_error
+
+    monkeypatch.setattr(Path, "unlink", fail_cleanup)
+    response = _download_and_import(db, "https://archiveofourown.org/works/123", "123", None, "added")
+
+    assert response.ok is True
+    assert response.calibre_book_id == 9
+    assert db.get_work("123").status == "ok"
+    assert epub.exists()
+    assert "cleanup failed" in caplog.text
+
+
+def test_epub_is_kept_if_success_cannot_be_saved(tmp_path, monkeypatch):
+    import sqlite3
+
+    db = Database(tmp_path / "test.sqlite3")
+    epub = tmp_path / "ao3-123.epub"
+    epub.write_text("epub")
+    monkeypatch.setenv("DOWNLOAD_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        "app.main.FanFicFareDownloader.download",
+        lambda *args, **kwargs: DownloadResult(epub_path=epub),
+    )
+    monkeypatch.setattr(
+        "app.main.CalibreLibrary.add_or_update",
+        lambda *args, **kwargs: CalibreImportResult(9, "Example", "Author"),
+    )
+    original_upsert = db.upsert_work
+
+    def fail_success_write(**kwargs):
+        if kwargs["status"] == "ok":
+            raise sqlite3.OperationalError("database is locked")
+        return original_upsert(**kwargs)
+
+    monkeypatch.setattr(db, "upsert_work", fail_success_write)
+    with pytest.raises(sqlite3.OperationalError):
+        _download_and_import(db, "https://archiveofourown.org/works/123", "123", None, "added")
+
+    assert epub.exists()
